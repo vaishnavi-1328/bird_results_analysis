@@ -3,7 +3,6 @@ import { Link } from "react-router-dom";
 import { useEffect, useRef } from "react";
 import screenshot from "../assets/screenshot.png";
 import driveLogo from "../assets/vite.svg";
-import eastImg from "../assets/east.jpeg";
 import westImg from "../assets/west.jpeg";
 import northImg from "../assets/north.jpeg";
 import farm1 from "../assets/farm1.jpg";
