@@ -8,6 +8,9 @@ import time
 
 log = logging.getLogger("bird_counter")
 
+# ── Profiling flag ─────────────────────────────────────────────────────────────
+_PROFILE = False  # Set True to enable per-stage timing instrumentation
+
 # ── Processing efficiency ──────────────────────────────────────────────────────
 FRAME_SKIP                       = 1     # process every frame — tiny distant birds appear briefly
 RESIZE_FACTOR                    = 1.0   # no downscale — preserves single-pixel distant birds
@@ -28,8 +31,8 @@ ADAPTIVE_C_LARGE                 = 4
 # ── Bird colour filter ────────────────────────────────────────────────────────
 # Birds are dark (grey/black) silhouettes. The contrast check pad scales with
 # blob size so large birds aren't self-cancelling.
-BIRD_MAX_BLOB_VALUE              = 200   # raised — large birds have feather highlights
-BIRD_MIN_CONTRAST                = 15    # reduced — large birds fill more of the sky patch
+BIRD_MAX_BLOB_VALUE              = 170   # grey-to-black birds (HSV V 0-170); bright sky is 180-240
+BIRD_MIN_CONTRAST                = 20    # surround must be clearly brighter than the bird
 # Minimum blob side-length (px) above which we use the large-block threshold pass
 LARGE_BIRD_MIN_SIDE              = 20
 
@@ -56,23 +59,25 @@ DIRECTIONAL_CHANGE_THRESHOLD     = 0.90  # relaxed — allow more uniform movers
 
 # ── Background subtraction ─────────────────────────────────────────────────────
 # MOG2 background subtractor catches any pixel-level movement in the sky.
-_MOG2_HISTORY                    = 300
-_MOG2_VAR_THRESHOLD              = 25    # higher = less sensitive, avoids static texture noise
+_MOG2_HISTORY                    = 200   # stable background model — not too short
+_MOG2_VAR_THRESHOLD              = 20    # not too sensitive — avoid sensor noise
 _MOG2_DETECT_SHADOWS             = False # shadow pixels would inflate counts
 
-# ── ROI — hard sky zone: top 60% of frame (= above 40% from ground) ───────────
-ROI_UPDATE_INTERVAL              = 10    # frames between horizon recalculations
-ROI_SMOOTHING_FACTOR             = 0.5   # blend weight for new ROI estimate
-INITIAL_ROI_BOTTOM_PERCENTAGE   = 60    # start at 60% from top
-ROI_MIN_PCT                      = 20.0
-ROI_MAX_PCT                      = 60.0  # never detect below 40% from ground
+# ── ROI — fixed: always use top 75% of frame ──────────────────────────────────
+# Dynamic horizon detection was misidentifying dense bird flocks as the horizon
+# and setting the ROI above them. Fixed ROI is simpler and more reliable.
+ROI_UPDATE_INTERVAL              = 50    # kept for compatibility but ROI no longer changes
+ROI_SMOOTHING_FACTOR             = 0.5
+INITIAL_ROI_BOTTOM_PERCENTAGE    = 75    # fixed at 75% from top
+ROI_MIN_PCT                      = 75.0  # min == max == fixed value
+ROI_MAX_PCT                      = 75.0
 
 # ── Temporal confirmation (tracker) ───────────────────────────────────────────
-MIN_MOVEMENT_DISTANCE            = 8     # total px moved across track — filters static objects
-MIN_FLIGHT_DURATION              = 4     # frames of consistent motion required
+MIN_MOVEMENT_DISTANCE            = 6     # restored — 4px total across track lifetime
+MIN_FLIGHT_DURATION              = 4     # restored original
 MAX_MATCHING_DISTANCE            = 60    # px; large nearby birds move fast between frames
 MAX_MATCHING_DISTANCE_CONFIRMED  = 120   # wider re-match for confirmed birds that briefly disappear
-MAX_STATIONARY_FRAMES            = 5     # drop unconfirmed tracks quickly
+MAX_STATIONARY_FRAMES            = 8     # must survive enough gaps for intermittent far-bird detections
 MAX_STATIONARY_FRAMES_CONFIRMED  = 20
 
 
@@ -85,34 +90,54 @@ def calculate_object_solidity(contour):
     return float(area) / hull_area if hull_area > 0 else 0.0
 
 
-def analyze_and_set_roi(frame, current_roi_bottom_pct):
+def analyze_and_set_roi(frame, current_roi_bottom_pct, frame_gray=None):
     """
     Estimate the sky-ground horizon using Sobel edge projection and return a
     smoothed ROI bottom percentage.  This is the adaptive ROI strategy from
     the paper: Sobel gradient → vertical projection → search upward until
     edge density drops, then temporally smooth.
+
+    frame_gray: optional precomputed grayscale of the full frame (avoids re-conversion).
     """
     height, width = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if frame_gray is not None:
+        gray = frame_gray
+    else:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (21, 21), 0)
     sobel_y = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=5)
     sobel_y = cv2.convertScaleAbs(sobel_y)
     vertical_projection = np.sum(sobel_y, axis=1)
 
     try:
-        peak_density_y = int(np.argmax(vertical_projection))
+        # Only search for the sky-ground boundary in the LOWER half of the frame.
+        # Searching the full frame causes a dense flock of birds (strong Sobel response
+        # in the upper sky) to be mistaken for the horizon, setting the ROI *above* the
+        # flock and cutting it out entirely. Buildings / ground are always in the lower
+        # portion of the frame.
+        search_start = height // 2
+        lower_projection = vertical_projection[search_start:]
+        if len(lower_projection) == 0:
+            return current_roi_bottom_pct
+
+        peak_offset = int(np.argmax(lower_projection))
+        peak_density_y = search_start + peak_offset
+
         if peak_density_y >= len(vertical_projection) - 1:
             return current_roi_bottom_pct
-        remaining = vertical_projection[peak_density_y:]
-        if len(remaining) == 0:
-            return current_roi_bottom_pct
-        threshold = np.percentile(remaining, 10)
+
+        # Search upward from the peak (the building/ground edge) to find where
+        # edge density drops — that is the actual sky-ground transition.
+        threshold = np.percentile(lower_projection, 10)
         horizon_y = peak_density_y
-        for y in range(peak_density_y, 0, -1):
+        for y in range(peak_density_y, search_start - 1, -1):
             if vertical_projection[y] < threshold:
                 horizon_y = y
                 break
+
         new_roi_bottom_pct = (horizon_y / height) * 100
+        # Add 8% buffer so birds flying just above the roofline are inside the ROI.
+        new_roi_bottom_pct = min(ROI_MAX_PCT, new_roi_bottom_pct + 8.0)
         smoothed = (current_roi_bottom_pct * (1.0 - ROI_SMOOTHING_FACTOR) +
                     new_roi_bottom_pct * ROI_SMOOTHING_FACTOR)
         return max(ROI_MIN_PCT, min(ROI_MAX_PCT, smoothed))
@@ -120,13 +145,11 @@ def analyze_and_set_roi(frame, current_roi_bottom_pct):
         return current_roi_bottom_pct
 
 
-def is_sky_color(frame, bbox, roi_bottom_pct):
+def is_sky_color(frame, bbox, roi_bottom_pct, hsv_frame=None):
     """
-    Multi-condition HSV sky classifier matching the four atmospheric states
-    described in the paper: clear blue, white/light-grey, light-blue/cyan,
-    and grey/overcast.  The HSV colour space is used because its Value channel
-    decouples luminance from chromaticity, making sky criteria stable across
-    illumination changes.
+    Multi-condition HSV sky classifier matching the four atmospheric states:
+    clear blue, white/light-grey, light-blue/cyan, and grey/overcast.
+    Checks the immediate region around the blob.
     """
     x, y, w, h = bbox
     frame_height, frame_width = frame.shape[:2]
@@ -139,36 +162,58 @@ def is_sky_color(frame, bbox, roi_bottom_pct):
     y1 = max(0, y - border)
     x2 = min(frame_width, x + w + border)
     y2 = min(frame_height, y + h + border)
-    region = frame[y1:y2, x1:x2]
-    if region.size == 0:
+
+    if x2 <= x1 or y2 <= y1:
         return False
 
-    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    if hsv_frame is not None:
+        hsv_h, hsv_w = hsv_frame.shape[:2]
+        hx1 = max(0, min(x1, hsv_w - 1))
+        hy1 = max(0, min(y1, hsv_h - 1))
+        hx2 = max(0, min(x2, hsv_w))
+        hy2 = max(0, min(y2, hsv_h))
+        if hx2 <= hx1 or hy2 <= hy1:
+            return False
+        hsv = hsv_frame[hy1:hy2, hx1:hx2]
+    else:
+        region = frame[y1:y2, x1:x2]
+        if region.size == 0:
+            return False
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+
+    if hsv.size == 0:
+        return False
+
     avg_sat = float(np.mean(hsv[:, :, 1]))
     avg_val = float(np.mean(hsv[:, :, 2]))
     avg_hue = float(np.mean(hsv[:, :, 0]))
 
-    # 1. White / light-grey sky (overcast or hazy) — low sat, high val
+    # 1. White / light-grey sky (overcast or hazy)
     if avg_sat < 55 and avg_val > 150:
         return True
-    # 2. Clear blue sky — hue in blue range, moderate sat
-    if 85 < avg_hue < 135 and avg_sat < 170 and avg_val > 75:
+    # 2. Clear blue sky — widened sat upper bound for saturated afternoon blue
+    # Fix 2: raised sat upper bound from 170 to 210 for deep saturated afternoon blue sky
+    if 85 < avg_hue < 135 and avg_sat < 210 and avg_val > 75:
         return True
     # 3. Light blue / cyan sky
-    if 75 < avg_hue < 110 and avg_sat < 130 and avg_val > 95:
+    if 75 < avg_hue < 110 and avg_sat < 180 and avg_val > 95:
         return True
-    # 4. Grey / overcast — very low sat, mid-range val
+    # 4. Grey / overcast
     if avg_sat < 28 and 70 < avg_val < 200:
         return True
 
     return False
 
 
-def is_likely_cloud(frame, bbox):
+def is_likely_cloud(frame, bbox, gray_roi=None, hsv_roi=None):
     """
     Multi-feature cloud rejection from the paper: simultaneously checks low
     texture variation, low edge density, and high colour uniformity — all
     characteristic of diffuse cloud surfaces rather than bird silhouettes.
+
+    gray_roi: optional precomputed grayscale of roi_bgr (same spatial extent as frame).
+    hsv_roi:  optional precomputed HSV of roi_bgr (same spatial extent as frame).
+    When provided, patches are sliced from the precomputed arrays instead of re-converting.
     """
     x, y, w, h = bbox
     # Only run for regions large enough to be clouds; tiny blobs are never clouds
@@ -181,11 +226,25 @@ def is_likely_cloud(frame, bbox):
     y2 = min(fh, y + h)
     if x2 <= x or y2 <= y:
         return False
-    region = frame[y:y2, x:x2]
-    if region.size == 0:
-        return False
 
-    gray_r = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    # Grayscale patch
+    if gray_roi is not None:
+        gh, gw = gray_roi.shape[:2]
+        gx1 = max(0, min(x, gw - 1))
+        gy1 = max(0, min(y, gh - 1))
+        gx2 = max(0, min(x2, gw))
+        gy2 = max(0, min(y2, gh))
+        if gx2 <= gx1 or gy2 <= gy1:
+            return False
+        gray_r = gray_roi[gy1:gy2, gx1:gx2]
+    else:
+        region = frame[y:y2, x:x2]
+        if region.size == 0:
+            return False
+        gray_r = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+
+    if gray_r.size == 0:
+        return False
 
     # Texture: average local standard deviation
     k = np.ones((TEXTURE_NEIGHBORHOOD, TEXTURE_NEIGHBORHOOD), np.float32) / (TEXTURE_NEIGHBORHOOD ** 2)
@@ -196,11 +255,26 @@ def is_likely_cloud(frame, bbox):
     avg_texture    = float(np.mean(np.sqrt(variance)))
 
     # Colour uniformity: std-dev of HSV saturation
-    hsv_r      = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-    color_std  = float(np.std(hsv_r[:, :, 1]))
+    if hsv_roi is not None:
+        hh, hw = hsv_roi.shape[:2]
+        hx1 = max(0, min(x, hw - 1))
+        hy1 = max(0, min(y, hh - 1))
+        hx2 = max(0, min(x2, hw))
+        hy2 = max(0, min(y2, hh))
+        if hx2 <= hx1 or hy2 <= hy1:
+            color_std = 0.0
+        else:
+            hsv_patch = hsv_roi[hy1:hy2, hx1:hx2]
+            color_std = float(np.std(hsv_patch[:, :, 1])) if hsv_patch.size > 0 else 0.0
+    else:
+        region = frame[y:y2, x:x2]
+        if region.size == 0:
+            return False
+        hsv_r    = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        color_std = float(np.std(hsv_r[:, :, 1]))
 
     # Edge density
-    edges       = cv2.Canny(gray_r, 50, 150)
+    edges        = cv2.Canny(gray_r, 50, 150)
     edge_density = np.count_nonzero(edges) / max(1, gray_r.size)
 
     return (avg_texture < CLOUD_TEXTURE_THRESHOLD
@@ -208,10 +282,14 @@ def is_likely_cloud(frame, bbox):
             and edge_density < CLOUD_EDGE_DENSITY_THRESHOLD)
 
 
-def is_dark_against_sky(roi_bgr, bbox):
+def is_dark_against_sky(roi_bgr, bbox, gray_roi=None, hsv_roi=None):
     """
     Return True only if the blob is a dark (grey/black) object against a brighter sky.
-    The surround pad scales with blob size so large nearby birds don't self-cancel.
+
+    Fast path: use precomputed gray_roi for the cheap brightness gate, then slice
+    directly from precomputed hsv_roi for the contrast check — avoids any BGR→HSV
+    conversion per contour. The surround is sampled as four thin border strips around
+    the blob rather than a masked ring, which is ~10× faster than numpy boolean masking.
     """
     x, y, w, h = bbox
     fh, fw = roi_bgr.shape[:2]
@@ -222,49 +300,94 @@ def is_dark_against_sky(roi_bgr, bbox):
     if x2 <= x1 or y2 <= y1:
         return False
 
-    blob_region = roi_bgr[y1:y2, x1:x2]
-    if blob_region.size == 0:
-        return False
+    # --- Cheap gray pre-check ---
+    if gray_roi is not None:
+        gh, gw = gray_roi.shape[:2]
+        gx1 = max(0, min(x1, gw - 1))
+        gy1 = max(0, min(y1, gh - 1))
+        gx2 = max(gx1 + 1, min(x2, gw))
+        gy2 = max(gy1 + 1, min(y2, gh))
+        blob_gray = gray_roi[gy1:gy2, gx1:gx2]
+        if blob_gray.size > 0 and float(np.mean(blob_gray)) > BIRD_MAX_BLOB_VALUE:
+            return False
 
-    blob_val = float(np.mean(cv2.cvtColor(blob_region, cv2.COLOR_BGR2HSV)[:, :, 2]))
+    # --- Blob HSV value ---
+    if hsv_roi is not None:
+        hh, hw = hsv_roi.shape[:2]
+        hx1 = max(0, min(x1, hw - 1))
+        hy1 = max(0, min(y1, hh - 1))
+        hx2 = max(hx1 + 1, min(x2, hw))
+        hy2 = max(hy1 + 1, min(y2, hh))
+        blob_v = hsv_roi[hy1:hy2, hx1:hx2, 2]
+        blob_val = float(np.mean(blob_v)) if blob_v.size > 0 else 255.0
+    else:
+        blob_region = roi_bgr[y1:y2, x1:x2]
+        if blob_region.size == 0:
+            return False
+        blob_val = float(np.mean(cv2.cvtColor(blob_region, cv2.COLOR_BGR2HSV)[:, :, 2]))
 
     if blob_val > BIRD_MAX_BLOB_VALUE:
         return False
 
-    # Pad = 20% of the larger side, minimum 6px — ensures surround is outside the bird
+    # --- Surround brightness via four border strips (no masking needed) ---
     pad = max(6, int(max(w, h) * 0.20))
     sx1 = max(0, x1 - pad)
     sy1 = max(0, y1 - pad)
     sx2 = min(fw, x2 + pad)
     sy2 = min(fh, y2 + pad)
 
-    # Sample only the outer ring, not the blob itself
-    full_patch  = roi_bgr[sy1:sy2, sx1:sx2]
-    inner_mask  = np.zeros(full_patch.shape[:2], dtype=np.uint8)
-    iy1 = y1 - sy1
-    ix1 = x1 - sx1
-    iy2 = iy1 + (y2 - y1)
-    ix2 = ix1 + (x2 - x1)
-    inner_mask[iy1:iy2, ix1:ix2] = 1
-    outer_pixels = full_patch[inner_mask == 0]
+    if hsv_roi is not None:
+        hh, hw = hsv_roi.shape[:2]
+        # Clamp surround to hsv_roi bounds
+        hsx1 = max(0, min(sx1, hw - 1))
+        hsy1 = max(0, min(sy1, hh - 1))
+        hsx2 = max(hsx1 + 1, min(sx2, hw))
+        hsy2 = max(hsy1 + 1, min(sy2, hh))
+        hx1c = max(0, min(x1, hw - 1))
+        hy1c = max(0, min(y1, hh - 1))
+        hx2c = max(hx1c + 1, min(x2, hw))
+        hy2c = max(hy1c + 1, min(y2, hh))
+        # Four strips: top, bottom, left, right (may overlap at corners but that's fine)
+        strips = []
+        if hsy1 < hy1c:
+            strips.append(hsv_roi[hsy1:hy1c, hsx1:hsx2, 2].ravel())
+        if hy2c < hsy2:
+            strips.append(hsv_roi[hy2c:hsy2, hsx1:hsx2, 2].ravel())
+        if hsx1 < hx1c:
+            strips.append(hsv_roi[hsy1:hsy2, hsx1:hx1c, 2].ravel())
+        if hx2c < hsx2:
+            strips.append(hsv_roi[hsy1:hsy2, hx2c:hsx2, 2].ravel())
+        if not strips:
+            return blob_val < BIRD_MAX_BLOB_VALUE
+        outer_vals = np.concatenate(strips)
+    else:
+        full_patch = roi_bgr[sy1:sy2, sx1:sx2]
+        if full_patch.size == 0:
+            return blob_val < BIRD_MAX_BLOB_VALUE
+        full_hsv = cv2.cvtColor(full_patch, cv2.COLOR_BGR2HSV)
+        iy1 = y1 - sy1; ix1 = x1 - sx1
+        iy2 = iy1 + (y2 - y1); ix2 = ix1 + (x2 - x1)
+        mask = np.ones(full_patch.shape[:2], dtype=bool)
+        mask[max(0,iy1):iy2, max(0,ix1):ix2] = False
+        outer_vals = full_hsv[:, :, 2][mask]
 
-    if outer_pixels.size == 0:
+    if outer_vals.size == 0:
         return blob_val < BIRD_MAX_BLOB_VALUE
 
-    outer_bgr    = outer_pixels.reshape(-1, 1, 3).astype(np.uint8)
-    outer_hsv    = cv2.cvtColor(outer_bgr, cv2.COLOR_BGR2HSV)
-    surround_val = float(np.mean(outer_hsv[:, :, 2]))
-
+    surround_val = float(np.percentile(outer_vals, 85))
     return (surround_val - blob_val) >= BIRD_MIN_CONTRAST
 
 
 # ── MOG2 foreground mask → detections ─────────────────────────────────────────
 
-def _extract_mog_detections(fg_mask, roi_bgr):
+def _extract_mog_detections(fg_mask, roi_bgr, gray_roi=None, hsv_roi=None):
     """
     Convert a MOG2 foreground mask into bird-candidate detections.
     Any pixel that changed against the learned background is a candidate.
     Tiny 1px blobs are allowed; only obvious clouds (large, low-texture) are rejected.
+
+    gray_roi: optional precomputed grayscale (same spatial extent as roi_bgr).
+    hsv_roi:  optional precomputed HSV (same spatial extent as roi_bgr).
     """
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
     cleaned = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
@@ -275,12 +398,17 @@ def _extract_mog_detections(fg_mask, roi_bgr):
         if not (area >= MIN_BIRD_AREA and area < MAX_BIRD_AREA):
             continue
         x, y, w, h = cv2.boundingRect(contour)
+        # Large merged MOG2 blobs (flock seen as one connected region) are silently
+        # dropped here — the adaptive threshold pipeline handles individual birds
+        # within the region instead. Do NOT add them as a single detection.
+        if w > 120 or h > 120:
+            continue
         aspect_ratio = (w / h) if h > 0 else 1.0
         if not (MIN_ASPECT_RATIO <= aspect_ratio <= MAX_ASPECT_RATIO):
             continue
-        if is_likely_cloud(roi_bgr, (x, y, w, h)):
+        if is_likely_cloud(roi_bgr, (x, y, w, h), gray_roi=gray_roi, hsv_roi=hsv_roi):
             continue
-        if not is_dark_against_sky(roi_bgr, (x, y, w, h)):
+        if not is_dark_against_sky(roi_bgr, (x, y, w, h), gray_roi=gray_roi, hsv_roi=hsv_roi):
             continue
         detections.append({
             'bbox':         (x, y, max(1, w), max(1, h)),
@@ -301,8 +429,11 @@ def detect_birds_in_frame(frame, frame_height=None, detection_boundary=None, thr
     2. Gaussian blur → adaptive Gaussian threshold (or fixed if supplied).
     3. Contour extraction with size / aspect-ratio / solidity / cloud filters.
 
-    A second pass at 1.5× and a third pass at 2.0× upscale are run to catch
-    birds that are too small to survive contour extraction at normal scale.
+    A second pass with coarse block and two upscale passes (1.5×, 2.0×) are run
+    to catch birds that are too small to survive contour extraction at normal scale.
+
+    Optimization: gray_roi is computed once before the passes and reused.
+    For scaled passes, the precomputed gray is resized rather than re-converting BGR.
     """
     if frame_height is None:
         frame_height = frame.shape[0]
@@ -311,12 +442,40 @@ def detect_birds_in_frame(frame, frame_height=None, detection_boundary=None, thr
 
     roi = frame[:detection_boundary, :]
 
-    def _detect_at_scale(roi_bgr, scale=1.0, block_size=ADAPTIVE_BLOCK_SIZE, c_val=ADAPTIVE_C):
+    # Precompute gray and HSV once for the entire ROI — reused across all passes
+    gray_roi_base = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv_roi_base  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    def _detect_at_scale(roi_bgr, scale=1.0, block_size=ADAPTIVE_BLOCK_SIZE,
+                         c_val=ADAPTIVE_C, precomputed_gray=None):
+        """
+        precomputed_gray: if provided at scale==1.0, skip cvtColor.
+                          if provided at scale!=1.0, resize this gray instead of
+                          resizing BGR then converting.
+        """
         if scale != 1.0:
             h0, w0 = roi_bgr.shape[:2]
-            roi_bgr = cv2.resize(roi_bgr, (int(w0 * scale), int(h0 * scale)),
-                                 interpolation=cv2.INTER_LINEAR)
-        gray    = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+            scaled_w = int(w0 * scale)
+            scaled_h = int(h0 * scale)
+            if precomputed_gray is not None:
+                # Resize precomputed gray — avoids resizing BGR then converting
+                gray = cv2.resize(precomputed_gray, (scaled_w, scaled_h),
+                                  interpolation=cv2.INTER_LINEAR)
+                # We still need a scaled BGR for is_dark_against_sky at native coords
+                # but that check uses the original roi (unscaled), so no scaled BGR needed here
+                roi_bgr_scaled = cv2.resize(roi_bgr, (scaled_w, scaled_h),
+                                            interpolation=cv2.INTER_LINEAR)
+            else:
+                roi_bgr_scaled = cv2.resize(roi_bgr, (scaled_w, scaled_h),
+                                            interpolation=cv2.INTER_LINEAR)
+                gray = cv2.cvtColor(roi_bgr_scaled, cv2.COLOR_BGR2GRAY)
+        else:
+            roi_bgr_scaled = roi_bgr
+            if precomputed_gray is not None:
+                gray = precomputed_gray
+            else:
+                gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
         # Blur kernel scales with block size so large-block pass smooths coarser structure
         ksize   = max(3, (block_size // 3) | 1)
         blurred = cv2.GaussianBlur(gray, (ksize, ksize), 0)
@@ -341,15 +500,41 @@ def detect_birds_in_frame(frame, frame_height=None, detection_boundary=None, thr
             aspect_ratio = (w / h) if h > 0 else 0
             if not (MIN_ASPECT_RATIO < aspect_ratio < MAX_ASPECT_RATIO):
                 continue
-            if calculate_object_solidity(contour) < MIN_BIRD_SOLIDITY:
-                continue
-            if is_likely_cloud(roi_bgr, (x, y, w, h)):
-                continue
+
+            # --- Cheap blob brightness pre-filter (uses gray slice, no HSV) ---
             inv = 1.0 / scale
             ox, oy = int(x * inv), int(y * inv)
             ow, oh = max(1, int(w * inv)), max(1, int(h * inv))
-            if not is_dark_against_sky(roi, (ox, oy, ow, oh)):
+
+            # Fast gray pre-check on the native-resolution gray before expensive ops
+            fh_g, fw_g = gray_roi_base.shape[:2]
+            gx1 = max(0, ox)
+            gy1 = max(0, oy)
+            gx2 = min(fw_g, ox + ow)
+            gy2 = min(fh_g, oy + oh)
+            if gx2 > gx1 and gy2 > gy1:
+                blob_gray_patch = gray_roi_base[gy1:gy2, gx1:gx2]
+                if blob_gray_patch.size > 0:
+                    if float(np.mean(blob_gray_patch)) > BIRD_MAX_BLOB_VALUE:
+                        continue
+
+            # --- Solidity check — skip convexHull for tiny single-pixel blobs ---
+            if area < 4:
+                solidity = 1.0
+            else:
+                solidity = calculate_object_solidity(contour)
+            if solidity < MIN_BIRD_SOLIDITY:
                 continue
+
+            # --- Cloud rejection (expensive) ---
+            if is_likely_cloud(roi_bgr_scaled, (x, y, w, h)):
+                continue
+
+            # --- Full contrast check at native resolution ---
+            if not is_dark_against_sky(roi, (ox, oy, ow, oh),
+                                       gray_roi=gray_roi_base, hsv_roi=hsv_roi_base):
+                continue
+
             detections.append({
                 'bbox':         (ox, oy, ow, oh),
                 'center':       (ox + ow // 2, oy + oh // 2),
@@ -357,7 +542,7 @@ def detect_birds_in_frame(frame, frame_height=None, detection_boundary=None, thr
                 'aspect_ratio': aspect_ratio,
                 'confidence':   min(1.0, area / 80.0),
             })
-        return detections, gray if scale == 1.0 else None
+        return detections
 
     def _merge(base, extras, tol=8):
         centres = [(d['center'][0], d['center'][1]) for d in base]
@@ -367,33 +552,34 @@ def detect_birds_in_frame(frame, frame_height=None, detection_boundary=None, thr
                 base.append(d)
                 centres.append((cx, cy))
 
-    # Pass A — fine block (catches distant 1-3px dots)
-    detections_all, gray_roi = _detect_at_scale(roi, scale=1.0,
-                                                 block_size=ADAPTIVE_BLOCK_SIZE,
-                                                 c_val=ADAPTIVE_C)
+    # Pass A — fine block at native scale: catches 1-3px distant birds
+    detections_all = _detect_at_scale(roi, scale=1.0,
+                                      block_size=ADAPTIVE_BLOCK_SIZE,
+                                      c_val=ADAPTIVE_C,
+                                      precomputed_gray=gray_roi_base)
 
-    # Pass B — coarse block (merges fragmented large nearby birds into one contour)
-    detections_large, _ = _detect_at_scale(roi, scale=1.0,
-                                            block_size=ADAPTIVE_BLOCK_SIZE_LARGE,
-                                            c_val=ADAPTIVE_C_LARGE)
-    _merge(detections_all, detections_large, tol=12)
+    # Pass B — 1.5× upscale: makes sub-pixel distant birds detectable as contours.
+    # The 2× pass and coarse-block pass were dropped — they produced mostly duplicates
+    # of Pass A / Pass B while doubling the adaptive threshold cost.
+    detections_up = _detect_at_scale(roi, scale=1.5,
+                                      block_size=ADAPTIVE_BLOCK_SIZE,
+                                      c_val=ADAPTIVE_C,
+                                      precomputed_gray=gray_roi_base)
+    _merge(detections_all, detections_up, tol=6)
 
-    # Pass C/D — upscale passes for very small distant birds
-    for scale in (1.5, 2.0):
-        detections_up, _ = _detect_at_scale(roi, scale=scale,
-                                             block_size=ADAPTIVE_BLOCK_SIZE,
-                                             c_val=ADAPTIVE_C)
-        _merge(detections_all, detections_up, tol=6)
-
-    return detections_all, gray_roi
+    return detections_all, gray_roi_base
 
 
 # ── Motion-based discrimination ────────────────────────────────────────────────
 
 def detect_moving_birds(current_detections, current_gray_roi, prev_gray_roi, roi_bgr):
     """
-    Farneback dense optical flow + frame differencing, as in the adaptive
-    threshold pipeline from the paper.  Per-candidate checks:
+    Localized Farneback dense optical flow + frame differencing.
+    Instead of computing flow over the full ROI, computes flow only on a small
+    padded patch around each candidate bounding box.  This preserves detection
+    quality for tiny 1-3px birds while dramatically reducing computation.
+
+    Per-candidate checks:
       - flow magnitude within [MIN_BIRD_SPEED, MAX_BIRD_SPEED]
       - directional consistency below DIRECTIONAL_CHANGE_THRESHOLD  OR
         the region is not cloud-like (so genuine birds that happen to fly
@@ -406,18 +592,12 @@ def detect_moving_birds(current_detections, current_gray_roi, prev_gray_roi, roi
     if prev_gray_roi.shape != current_gray_roi.shape:
         return [], current_gray_roi
 
-    flow = cv2.calcOpticalFlowFarneback(
-        prev_gray_roi, current_gray_roi, None,
-        _FB_PYR_SCALE, _FB_LEVELS, _FB_WIN_SIZE,
-        _FB_ITERATIONS, _FB_POLY_N, _FB_POLY_SIGMA, 0,
-    )
-    frame_diff = cv2.absdiff(prev_gray_roi, current_gray_roi)
-    fh, fw    = current_gray_roi.shape[:2]
+    fh, fw = current_gray_roi.shape[:2]
     moving_birds = []
 
     for detection in current_detections:
         x, y, w, h = detection['bbox']
-        # Clamp to ROI bounds
+        # Clamp bbox to ROI bounds
         x  = max(0, x)
         y  = max(0, y)
         x2 = min(fw, x + w)
@@ -425,12 +605,65 @@ def detect_moving_birds(current_detections, current_gray_roi, prev_gray_roi, roi
         if x2 <= x or y2 <= y:
             continue
 
-        roi_diff = frame_diff[y:y2, x:x2]
+        # Pad just enough for Farneback to compute stable flow, but no more.
+        # Large pads cause patch to overlap neighboring birds in a flock, averaging
+        # out flow and failing the speed threshold. Cap pad at 2× the bird dimension.
+        pad = min(max(4, max(w, h)), 16)
+        px1 = max(0, x - pad)
+        py1 = max(0, y - pad)
+        px2 = min(fw, x2 + pad)
+        py2 = min(fh, y2 + pad)
+
+        # Ensure patch is at least 5×5 to avoid degenerate flow
+        if (px2 - px1) < 5 or (py2 - py1) < 5:
+            # Expand to minimum 5×5 clamped to ROI
+            px2 = min(fw, px1 + max(5, px2 - px1))
+            py2 = min(fh, py1 + max(5, py2 - py1))
+            if (px2 - px1) < 5 or (py2 - py1) < 5:
+                continue
+
+        # Extract patches from both frames
+        prev_patch    = prev_gray_roi[py1:py2, px1:px2]
+        current_patch = current_gray_roi[py1:py2, px1:px2]
+
+        if prev_patch.size == 0 or current_patch.size == 0:
+            continue
+
+        # For tiny patches (far birds), use a smaller window so the sky around
+        # the bird doesn't dominate the flow estimate.
+        patch_h, patch_w = prev_patch.shape[:2]
+        win = max(3, min(_FB_WIN_SIZE, patch_w // 3, patch_h // 3) | 1)
+        levels = max(1, min(_FB_LEVELS, int(math.log2(min(patch_w, patch_h) / 4 + 1))))
+
+        patch_flow = cv2.calcOpticalFlowFarneback(
+            prev_patch, current_patch, None,
+            _FB_PYR_SCALE, levels, win,
+            _FB_ITERATIONS, _FB_POLY_N, _FB_POLY_SIGMA, 0,
+        )
+
+        # Frame diff on the patch
+        patch_diff = cv2.absdiff(prev_patch, current_patch)
+
+        # Center region of the patch = the bbox area within the patch
+        rel_x1 = x  - px1
+        rel_y1 = y  - py1
+        rel_x2 = x2 - px1
+        rel_y2 = y2 - py1
+        # Clamp to patch bounds
+        rel_x1 = max(0, rel_x1)
+        rel_y1 = max(0, rel_y1)
+        rel_x2 = min(px2 - px1, rel_x2)
+        rel_y2 = min(py2 - py1, rel_y2)
+
+        if rel_x2 <= rel_x1 or rel_y2 <= rel_y1:
+            continue
+
+        roi_diff = patch_diff[rel_y1:rel_y2, rel_x1:rel_x2]
         if roi_diff.size == 0:
             continue
         motion_pixels = int(np.count_nonzero(roi_diff > MOTION_THRESHOLD))
 
-        roi_flow = flow[y:y2, x:x2]
+        roi_flow = patch_flow[rel_y1:rel_y2, rel_x1:rel_x2]
         if roi_flow.size == 0:
             continue
         mag, _ = cv2.cartToPolar(roi_flow[..., 0], roi_flow[..., 1])
@@ -446,9 +679,16 @@ def detect_moving_birds(current_detections, current_gray_roi, prev_gray_roi, roi
         else:
             flow_consistency = 1.0
 
+        # For very small far blobs (≤ 6px²), the localized patch is mostly sky —
+        # avg_magnitude is sky flow, not bird flow. Frame diff on the blob pixels
+        # is the only reliable signal. Skip the flow magnitude gate for these.
+        blob_area = (x2 - x) * (y2 - y)
+        flow_magnitude_ok = MIN_BIRD_SPEED < avg_magnitude < MAX_BIRD_SPEED
+        diff_only_ok = blob_area <= 6 and motion_pixels >= 1
+
         passes_motion = (
             motion_pixels >= MIN_MOTION_PIXELS
-            and MIN_BIRD_SPEED < avg_magnitude < MAX_BIRD_SPEED
+            and (flow_magnitude_ok or diff_only_ok)
             and (
                 flow_consistency < DIRECTIONAL_CHANGE_THRESHOLD
                 or not is_likely_cloud(roi_bgr, (x, y, w, h))
@@ -472,12 +712,23 @@ class ImprovedBirdTracker:
         self.track_id             = 0
         self.confirmed_flying_birds = set()
 
-    def _near_confirmed_track(self, x, y, exclude_tid=None):
+    def _is_duplicate_of_confirmed(self, x, y, exclude_tid=None):
+        """
+        Returns True only if (x,y) lands inside the bounding box of an existing
+        confirmed track — meaning it is almost certainly a re-detection of the
+        same individual, not a new bird.
+        Using bbox overlap instead of a radius prevents suppressing neighboring
+        birds in a dense flock that are close but spatially distinct.
+        """
         for tid in self.confirmed_flying_birds:
             if tid == exclude_tid or tid not in self.tracks:
                 continue
-            lx, ly = self.tracks[tid]['positions'][-1]
-            if math.sqrt((x - lx) ** 2 + (y - ly) ** 2) < MAX_MATCHING_DISTANCE:
+            bbox = self.tracks[tid].get('last_bbox')
+            if bbox is None:
+                continue
+            bx, by, bw, bh = bbox
+            # Expand bbox by 2px for tolerance
+            if (bx - 2 <= x <= bx + bw + 2) and (by - 2 <= y <= by + bh + 2):
                 return True
         return False
 
@@ -487,7 +738,7 @@ class ImprovedBirdTracker:
 
         for detection in detections:
             x, y = detection['center']
-            best_match, min_dist = None, float('inf')
+            best_match, min_dist_sq = None, float('inf')
 
             for tid, tdata in self.tracks.items():
                 if tid in matched_tracks or not tdata['positions']:
@@ -505,12 +756,20 @@ class ImprovedBirdTracker:
                     lx = lx + vx * frames_missing
                     ly = ly + vy * frames_missing
 
-                d      = math.sqrt((x - lx) ** 2 + (y - ly) ** 2)
                 radius = (MAX_MATCHING_DISTANCE_CONFIRMED
                           if tid in self.confirmed_flying_birds
                           else MAX_MATCHING_DISTANCE)
-                if d < min_dist and d < radius:
-                    min_dist, best_match = d, tid
+
+                dx = x - lx
+                dy = y - ly
+                # Manhattan pre-filter: skip expensive sqrt if clearly out of range
+                if abs(dx) > radius or abs(dy) > radius:
+                    continue
+
+                dist_sq = dx * dx + dy * dy
+                radius_sq = radius * radius
+                if dist_sq < min_dist_sq and dist_sq < radius_sq:
+                    min_dist_sq, best_match = dist_sq, tid
 
             if best_match is not None:
                 self.tracks[best_match]['positions'].append((x, y))
@@ -520,11 +779,13 @@ class ImprovedBirdTracker:
                 matched_tracks[best_match] = detection
                 if (best_match not in self.confirmed_flying_birds
                         and self.is_flying_improved(best_match)):
-                    if not self._near_confirmed_track(x, y, exclude_tid=best_match):
+                    if not self._is_duplicate_of_confirmed(x, y, exclude_tid=best_match):
                         self.confirmed_flying_birds.add(best_match)
                         current_frame_birds.append(detection)
             else:
-                if not self._near_confirmed_track(x, y):
+                # Always create a new track — _is_duplicate_of_confirmed only blocks
+                # re-detections literally inside an existing confirmed bbox, not nearby birds
+                if not self._is_duplicate_of_confirmed(x, y):
                     self.tracks[self.track_id] = {
                         'positions':       [(x, y)],
                         'stationary_count': 0,
@@ -558,6 +819,9 @@ class ImprovedBirdTracker:
             if dx != 0 or dy != 0:
                 directions.append(math.atan2(dy, dx))
 
+        if total_distance < MIN_MOVEMENT_DISTANCE:
+            return False
+
         direction_changes = 0
         for i in range(1, len(directions)):
             diff = abs(directions[i] - directions[i - 1])
@@ -577,9 +841,13 @@ class ImprovedBirdTracker:
         ratios = [d['aspect_ratio'] for d in dets if 'aspect_ratio' in d]
         if ratios and np.std(ratios) > 0.1:
             good_bird_features += 1
+        # Fix 4: A track seen across MIN_FLIGHT_DURATION+2 frames is itself evidence
+        # of a real object. Far flock birds move in straight lines (no direction_changes)
+        # and have near-zero flow scores — this gives them a confirmation path.
+        if len(positions) >= MIN_FLIGHT_DURATION + 2:
+            good_bird_features += 1
 
-        return (total_distance > MIN_MOVEMENT_DISTANCE
-                and (direction_changes > 0 or good_bird_features >= 1))
+        return (direction_changes > 0 or good_bird_features >= 1)
 
     def get_unique_flying_birds_count(self):
         return len(self.confirmed_flying_birds)
@@ -630,6 +898,10 @@ def process_video_with_unique_bird_counting(video_path, show_display=False, thre
     max_concurrent_birds = 0
     start_time        = time.time()
 
+    # Profile accumulators
+    _p = {k: 0.0 for k in ('decode', 'roi_update', 'adaptive_threshold',
+                             'mog2', 'sky_filter', 'optical_flow', 'tracking', 'display')}
+
     try:
         while True:
             for _ in range(FRAME_SKIP - 1):
@@ -637,6 +909,7 @@ def process_video_with_unique_bird_counting(video_path, show_display=False, thre
                 if not ret:
                     break
 
+            _t0 = time.perf_counter() if _PROFILE else 0
             ret, frame = cap.read()
             if not ret:
                 break
@@ -646,35 +919,56 @@ def process_video_with_unique_bird_counting(video_path, show_display=False, thre
             if RESIZE_FACTOR != 1.0:
                 frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
-            if frame_count <= FRAME_SKIP or frame_count % (ROI_UPDATE_INTERVAL * FRAME_SKIP) == 0:
-                roi_bottom_pct    = analyze_and_set_roi(frame, roi_bottom_pct)
-                detection_boundary = int(new_height * roi_bottom_pct / 100.0)
+            if _PROFILE:
+                _p['decode'] += time.perf_counter() - _t0
 
             roi_bgr = frame[:detection_boundary, :]
+
+            # Precompute ROI-level gray and HSV once — shared by sky_filter, mog2, etc.
+            roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+            roi_hsv  = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+
+            _t0 = time.perf_counter() if _PROFILE else 0
             current_detections, current_gray_roi = detect_birds_in_frame(
                 frame, new_height, detection_boundary, threshold=threshold
             )
+            if _PROFILE:
+                _p['adaptive_threshold'] += time.perf_counter() - _t0
 
             # MOG2 background subtraction: detect any pixel-level movement in the sky
+            _t0 = time.perf_counter() if _PROFILE else 0
             fg_mask = bg_subtractor.apply(roi_bgr)
-            mog_detections = _extract_mog_detections(fg_mask, roi_bgr)
+            mog_detections = _extract_mog_detections(fg_mask, roi_bgr,
+                                                      gray_roi=roi_gray, hsv_roi=roi_hsv)
             existing = [(d['center'][0], d['center'][1]) for d in current_detections]
             for d in mog_detections:
                 cx, cy = d['center']
                 if not any(abs(cx - ex) < 6 and abs(cy - ey) < 6 for ex, ey in existing):
                     current_detections.append(d)
                     existing.append((cx, cy))
+            if _PROFILE:
+                _p['mog2'] += time.perf_counter() - _t0
 
+            # Sky color filter — reuse precomputed roi_hsv (all candidates are within ROI)
+            _t0 = time.perf_counter() if _PROFILE else 0
             sky_detections = [
                 d for d in current_detections
-                if is_sky_color(frame, d['bbox'], roi_bottom_pct)
+                if is_sky_color(roi_bgr, d['bbox'], roi_bottom_pct, hsv_frame=roi_hsv)
             ]
+            if _PROFILE:
+                _p['sky_filter'] += time.perf_counter() - _t0
 
+            _t0 = time.perf_counter() if _PROFILE else 0
             moving_detections, prev_frame_cache = detect_moving_birds(
                 sky_detections, current_gray_roi, prev_frame_cache, roi_bgr
             )
+            if _PROFILE:
+                _p['optical_flow'] += time.perf_counter() - _t0
 
+            _t0 = time.perf_counter() if _PROFILE else 0
             bird_tracker.update_tracks(moving_detections)
+            if _PROFILE:
+                _p['tracking'] += time.perf_counter() - _t0
 
             unique_flying_birds  = bird_tracker.get_unique_flying_birds_count()
             currently_active     = bird_tracker.get_currently_active_birds()
@@ -693,6 +987,13 @@ def process_video_with_unique_bird_counting(video_path, show_display=False, thre
         unique_flying_birds = bird_tracker.get_unique_flying_birds_count()
         total_time          = time.time() - start_time
         frames_per_second   = frame_count / total_time if total_time > 0 else 0
+
+        if _PROFILE and frame_count > 0:
+            total_stage = sum(_p.values())
+            for stage, t in _p.items():
+                ms_per_frame = t * 1000.0 / frame_count
+                pct = (t / total_stage * 100) if total_stage > 0 else 0
+                print(f"[profile] {stage}: {ms_per_frame:.2f}ms/frame ({pct:.1f}% total)")
 
         print(f"  DONE — {unique_flying_birds} unique flying birds in {total_time:.2f}s")
 
@@ -724,7 +1025,7 @@ def process_video_with_unique_bird_counting(video_path, show_display=False, thre
 
 _YELLOW              = (0, 255, 255)
 _RED                 = (0, 0, 255)
-_FRAME_SEND_INTERVAL = 5
+_FRAME_SEND_INTERVAL = 15  # send annotated frame every N processed frames
 
 
 def process_video_streaming(video_path, threshold=None):
@@ -773,6 +1074,10 @@ def process_video_streaming(video_path, threshold=None):
     total_motion_sum       = 0.0
     total_motion_count     = 0
 
+    # Profile accumulators
+    _p = {k: 0.0 for k in ('decode', 'roi_update', 'adaptive_threshold',
+                             'mog2', 'sky_filter', 'optical_flow', 'tracking', 'display')}
+
     try:
         while True:
             for _ in range(FRAME_SKIP - 1):
@@ -780,6 +1085,7 @@ def process_video_streaming(video_path, threshold=None):
                 if not ret:
                     break
 
+            _t0 = time.perf_counter() if _PROFILE else 0
             ret, frame = cap.read()
             if not ret:
                 if frame_count == 0:
@@ -795,35 +1101,56 @@ def process_video_streaming(video_path, threshold=None):
             if RESIZE_FACTOR != 1.0:
                 frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
-            if frame_count <= FRAME_SKIP or frame_count % (ROI_UPDATE_INTERVAL * FRAME_SKIP) == 0:
-                roi_bottom_pct    = analyze_and_set_roi(frame, roi_bottom_pct)
-                detection_boundary = int(new_height * roi_bottom_pct / 100.0)
+            if _PROFILE:
+                _p['decode'] += time.perf_counter() - _t0
 
             roi_bgr = frame[:detection_boundary, :]
+
+            # Precompute ROI-level gray and HSV once per frame
+            roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+            roi_hsv  = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+
+            _t0 = time.perf_counter() if _PROFILE else 0
             current_detections, current_gray_roi = detect_birds_in_frame(
                 frame, new_height, detection_boundary, threshold=threshold
             )
+            if _PROFILE:
+                _p['adaptive_threshold'] += time.perf_counter() - _t0
 
             # MOG2 background subtraction: detect any pixel-level movement in the sky
+            _t0 = time.perf_counter() if _PROFILE else 0
             fg_mask = bg_subtractor.apply(roi_bgr)
-            mog_detections = _extract_mog_detections(fg_mask, roi_bgr)
+            mog_detections = _extract_mog_detections(fg_mask, roi_bgr,
+                                                      gray_roi=roi_gray, hsv_roi=roi_hsv)
             existing = [(d['center'][0], d['center'][1]) for d in current_detections]
             for d in mog_detections:
                 cx, cy = d['center']
                 if not any(abs(cx - ex) < 6 and abs(cy - ey) < 6 for ex, ey in existing):
                     current_detections.append(d)
                     existing.append((cx, cy))
+            if _PROFILE:
+                _p['mog2'] += time.perf_counter() - _t0
 
+            # Sky color filter — reuse precomputed roi_hsv (all candidates are within ROI)
+            _t0 = time.perf_counter() if _PROFILE else 0
             sky_detections = [
                 d for d in current_detections
-                if is_sky_color(frame, d['bbox'], roi_bottom_pct)
+                if is_sky_color(roi_bgr, d['bbox'], roi_bottom_pct, hsv_frame=roi_hsv)
             ]
+            if _PROFILE:
+                _p['sky_filter'] += time.perf_counter() - _t0
 
+            _t0 = time.perf_counter() if _PROFILE else 0
             moving_detections, prev_frame_cache = detect_moving_birds(
                 sky_detections, current_gray_roi, prev_frame_cache, roi_bgr
             )
+            if _PROFILE:
+                _p['optical_flow'] += time.perf_counter() - _t0
 
+            _t0 = time.perf_counter() if _PROFILE else 0
             bird_tracker.update_tracks(moving_detections)
+            if _PROFILE:
+                _p['tracking'] += time.perf_counter() - _t0
 
             unique_flying_birds = bird_tracker.get_unique_flying_birds_count()
             currently_active    = bird_tracker.get_currently_active_birds()
@@ -855,6 +1182,7 @@ def process_video_streaming(video_path, threshold=None):
                     len(current_detections), len(sky_detections), len(moving_detections),
                 )
 
+            _t0 = time.perf_counter() if _PROFILE else 0
             if frame_count % _FRAME_SEND_INTERVAL == 0:
                 display = frame.copy()
 
@@ -882,6 +1210,8 @@ def process_video_streaming(video_path, threshold=None):
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
                 )
                 yield {"kind": "frame", "frame": display}
+            if _PROFILE:
+                _p['display'] += time.perf_counter() - _t0
 
             if frame_count % (100 * FRAME_SKIP) == 0:
                 elapsed = time.time() - start_time
@@ -905,6 +1235,13 @@ def process_video_streaming(video_path, threshold=None):
             unique_flying_birds, frame_count, total_time,
             frame_count / total_time if total_time > 0 else 0,
         )
+
+        if _PROFILE and frame_count > 0:
+            total_stage = sum(_p.values())
+            for stage, t in _p.items():
+                ms_per_frame = t * 1000.0 / frame_count
+                pct = (t / total_stage * 100) if total_stage > 0 else 0
+                log.info("[profile] %s: %.2fms/frame (%.1f%% total)", stage, ms_per_frame, pct)
 
         total_minutes = (int(frame_count / fps / 60) + 1) if fps > 0 else 0
         minute_counts = [birds_per_minute_counts.get(m, 0) for m in range(total_minutes)]
