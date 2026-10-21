@@ -779,9 +779,10 @@ def detect_moving_birds_farneback(current_detections, current_gray_roi, prev_gra
 
 class ImprovedBirdTracker:
     def __init__(self):
-        self.tracks               = {}
-        self.track_id             = 0
-        self.confirmed_flying_birds = set()
+        self.tracks                  = {}
+        self.track_id                = 0
+        self.confirmed_flying_birds  = set()   # active confirmed tracks only
+        self._total_confirmed        = 0       # running count — never decrements
 
     def _is_duplicate_of_confirmed(self, x, y, exclude_tid=None):
         """
@@ -852,7 +853,12 @@ class ImprovedBirdTracker:
                         and self.is_flying_improved(best_match)):
                     if not self._is_duplicate_of_confirmed(x, y, exclude_tid=best_match):
                         self.confirmed_flying_birds.add(best_match)
+                        self._total_confirmed += 1
                         current_frame_birds.append(detection)
+                        # Bird is confirmed — history served its purpose, clear it now.
+                        # Keep only last 2 positions for velocity extrapolation.
+                        self.tracks[best_match]['positions'] = self.tracks[best_match]['positions'][-2:]
+                        self.tracks[best_match]['detections'] = []
             else:
                 # Always create a new track — _is_duplicate_of_confirmed only blocks
                 # re-detections literally inside an existing confirmed bbox, not nearby birds
@@ -872,6 +878,9 @@ class ImprovedBirdTracker:
                          if tid in self.confirmed_flying_birds
                          else MAX_STATIONARY_FRAMES)
                 if self.tracks[tid]['stationary_count'] >= limit:
+                    # Remove from confirmed set so _is_duplicate_of_confirmed never
+                    # scans this dead track again — previously it stayed in the set forever.
+                    self.confirmed_flying_birds.discard(tid)
                     del self.tracks[tid]
 
         return current_frame_birds
@@ -921,7 +930,7 @@ class ImprovedBirdTracker:
         return (direction_changes > 0 or good_bird_features >= 1)
 
     def get_unique_flying_birds_count(self):
-        return len(self.confirmed_flying_birds)
+        return self._total_confirmed
 
     def get_currently_active_birds(self):
         return len(self.confirmed_flying_birds & self.tracks.keys())
