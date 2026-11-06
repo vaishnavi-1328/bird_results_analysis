@@ -1,0 +1,5 @@
+{"event": "start", "video": "C:\\Farm_videos\\10212026\\locationB\\merged.mp4", "width": 1920, "height": 1080, "fps": 29.97, "total_frames": 697742, "duration_hours": 6.47, "python": "3.14.8", "opencv": "5.0.0", "cpu_count": 20, "cv_threads": 4, "resume_from_frame": 0, "t": "2026-11-06T14:55:15"}
+{"event": "hb", "last_frame": 209, "last_video_time": "0:00:06", "progress_pct": 0.03, "rss_mb": 294, "sys_avail_gb": 17.55, "cpu_pct": 25.3, "unique_flying_birds": 0, "elapsed_s": 5, "t": "2026-11-06T14:55:20"}
+{"event": "hb", "last_frame": 2233, "last_video_time": "0:01:14", "progress_pct": 0.32, "rss_mb": 325, "sys_avail_gb": 17.54, "cpu_pct": 19.8, "unique_flying_birds": 1, "elapsed_s": 56, "t": "2026-11-06T14:56:11"}
+{"event": "hb", "last_frame": 4396, "last_video_time": "0:02:26", "progress_pct": 0.63, "rss_mb": 329, "sys_avail_gb": 17.3, "cpu_pct": 19.3, "unique_flying_birds": 3, "elapsed_s": 113, "t": "2026-11-06T14:57:08"}
+{"event": "hb", "last_frame": 6419, "last_video_time": "0:03:34", "progress_pct": 0.92, "rss_mb": 327, "sys_avail_gb": 18.0, "cpu_pct": 21.6, "unique_flying_birds": 3, "elapsed_s": 169, "t": "2026-11-06T14:58:04"}

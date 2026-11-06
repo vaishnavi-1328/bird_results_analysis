@@ -1,0 +1,2 @@
+{"event": "start", "video": "C:\\Farm_videos\\10212026\\locationB\\merged.mp4", "width": 1920, "height": 1080, "fps": 29.97, "total_frames": 697742, "duration_hours": 6.47, "python": "3.14.8", "opencv": "5.0.0", "cpu_count": 20, "cv_threads": 4, "resume_from_frame": 0, "t": "2026-11-06T14:54:58"}
+{"event": "hb", "last_frame": 209, "last_video_time": "0:00:06", "progress_pct": 0.03, "rss_mb": 292, "sys_avail_gb": 17.55, "cpu_pct": 23.4, "unique_flying_birds": 0, "elapsed_s": 5, "t": "2026-11-06T14:55:03"}
