@@ -4,9 +4,26 @@ import numpy as np
 import math
 import logging
 import os
+import pickle
 import time
+from collections import deque
 
 log = logging.getLogger("bird_counter")
+
+# ── CPU load ───────────────────────────────────────────────────────────────────
+# Multi-hour runs at OpenCV's default thread count (one per core) blue-screened the
+# processing PC. 4 threads halves total CPU work for ~13% more wall time, with
+# identical detections. Override with BIRD_CV_THREADS (0 = OpenCV default).
+CV_THREADS = int(os.environ.get("BIRD_CV_THREADS", "4"))
+if CV_THREADS > 0:
+    cv2.setNumThreads(CV_THREADS)
+
+# ── Checkpointing ──────────────────────────────────────────────────────────────
+CHECKPOINT_INTERVAL_S            = 300   # save tracker state every 5 min of processing
+# MOG2 can't be serialized, so on resume its background is rebuilt by replaying
+# this many processed frames before the checkpoint (3x its history, so older frames
+# that still weigh on the model are included too).
+RESUME_WARMUP_FRAMES             = 450
 
 # ── Profiling flag ─────────────────────────────────────────────────────────────
 _PROFILE = False  # Set True to enable per-stage timing instrumentation
@@ -79,6 +96,21 @@ MAX_MATCHING_DISTANCE            = 60    # px; large nearby birds move fast betw
 MAX_MATCHING_DISTANCE_CONFIRMED  = 120   # wider re-match for confirmed birds that briefly disappear
 MAX_STATIONARY_FRAMES            = 8     # must survive enough gaps for intermittent far-bird detections
 MAX_STATIONARY_FRAMES_CONFIRMED  = 20
+
+# ── v2 bird-vs-cloud discrimination ───────────────────────────────────────────
+# v1 counted broken cloud, fans and roof edges as birds (Oct 6 B: 4,000 "birds"/min).
+DARK_KERNEL                      = 15    # px; black-hat window: finds spots smaller than this that are darker than the sky around them
+MIN_DARKNESS                     = 35    # how much darker (HSV V, 0-255) a spot must be than its surroundings
+MAX_BIRD_SIDE                    = 80    # px; larger dark regions are buildings or cloud shadows
+RING_GAP                         = 6     # px between a candidate and the sky points it is compared with
+MIN_REL_SPEED                    = 0.7   # px per processed frame faster than the surrounding sky
+MIN_TRACK_POINTS                 = 6     # sightings before a track can be counted (~0.4 s)
+MIN_NET_DISPLACEMENT             = 15    # px from first to last sighting: rules out fans, roof edges, cloud bits
+MIN_TRACK_SPEED                  = 1.0   # px per processed frame, first to last sighting: drifting cloud bits are slower
+SKY_EDGE_LOW, SKY_EDGE_HIGH      = 30, 90   # Canny on the median frame: roof lines, walls, poles (50/150 missed pale walls under grey sky)
+SKY_MASK_MARGIN                  = 6     # px kept clear around buildings (roof edges shimmer)
+SKY_MASK_SAMPLES                 = 15    # frames medianed for the mask, one every SKY_MASK_EVERY
+SKY_MASK_EVERY                   = 30    # processed frames between samples (2 s)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -672,6 +704,83 @@ def detect_moving_birds(current_detections, current_gray_roi, prev_gray_roi, roi
     return moving_birds, current_gray_roi
 
 
+# ── v2 candidate detection and motion check ───────────────────────────────────
+
+def detect_dark_objects(roi_hsv):
+    """Candidates = spots clearly darker than the sky right around them, measured on HSV
+    brightness (V), where blue sky and white cloud are both bright and only silhouettes are dark.
+    Native scale finds distant birds; 1/4 scale finds close birds up to ~60 px."""
+    v = roi_hsv[:, :, 2]
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (DARK_KERNEL, DARK_KERNEL))
+    found = {}
+    for scale in (1, 4):
+        vs = v if scale == 1 else cv2.resize(v, (v.shape[1] // 4, v.shape[0] // 4), interpolation=cv2.INTER_AREA)
+        mask = np.uint8(cv2.morphologyEx(vs, cv2.MORPH_BLACKHAT, k) >= MIN_DARKNESS) * 255
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        found[scale] = []
+        for x, y, w, h, area in stats[1:]:
+            x, y, w, h = int(x) * scale, int(y) * scale, int(w) * scale, int(h) * scale
+            if (scale == 4 and max(w, h) < DARK_KERNEL) or max(w, h) > MAX_BIRD_SIDE:
+                continue
+            found[scale].append({'bbox': (x, y, w, h), 'center': (x + w // 2, y + h // 2),
+                                 'area': float(area * scale * scale), 'aspect_ratio': w / h})
+    inside = lambda c, b: b[0] <= c[0] <= b[0] + b[2] and b[1] <= c[1] <= b[1] + b[3]
+    small = [d for d in found[1] if not any(inside(d['center'], L['bbox']) for L in found[4])]
+    return small + found[4]
+
+
+def build_sky_mask(roi_samples):
+    """True where the ROI is open sky. On the median of recent frames (moving birds vanish),
+    sky is whatever is reachable from the top edge without crossing a strong outline; enclosed
+    islands (crisp cloud edges) are filled back in; anything joined to the bottom of the ROI
+    (ground, barns, fans, poles) is not sky."""
+    med = np.median(np.stack(roi_samples), axis=0).astype(np.uint8)
+    gray = cv2.GaussianBlur(cv2.cvtColor(med, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+    walls = cv2.dilate(cv2.Canny(gray, SKY_EDGE_LOW, SKY_EDGE_HIGH), np.ones((3, 3), np.uint8))
+    _, lab = cv2.connectedComponents(np.uint8(walls == 0), connectivity=4)
+    top = np.unique(lab[0][walls[0] == 0])
+    sky = np.isin(lab, top[top > 0])
+    _, lab = cv2.connectedComponents(np.uint8(~sky), connectivity=8)
+    ground = np.unique(lab[-1][~sky[-1]])
+    sky |= ~np.isin(lab, ground[ground > 0])                  # fill enclosed islands
+    # In each column the sky ends at the first non-sky pixel from the top, so a wall
+    # under a faint, partly-detected roofline is excluded too.
+    blocked = ~sky
+    first = np.where(blocked.any(axis=0), blocked.argmax(axis=0), sky.shape[0])
+    sky &= np.arange(sky.shape[0])[:, None] < first
+    k = 2 * SKY_MASK_MARGIN + 1
+    return cv2.dilate(np.uint8(~sky), np.ones((k, k), np.uint8)) == 0
+
+
+def moving_against_sky(dets, prev_gray, cur_gray):
+    """Keep candidates that move relative to the sky right around them. A dark patch of
+    cloud drifts with the cloud around it (relative speed ~0); a bird crosses it."""
+    if prev_gray is None or not dets or prev_gray.shape != cur_gray.shape:
+        return []
+    h, w = cur_gray.shape
+    pts = []
+    for d in dets:
+        (cx, cy), (bw, bh) = d['center'], d['bbox'][2:]
+        r = max(bw, bh) + RING_GAP
+        for px, py in ((cx, cy), (cx - r, cy), (cx + r, cy), (cx, cy - r), (cx, cy + r)):
+            pts.append((min(max(px, 0), w - 1), min(max(py, 0), h - 1)))
+    p0 = np.float32(pts).reshape(-1, 1, 2)
+    # current -> previous: where was the thing that is here now?
+    p1, st, _ = cv2.calcOpticalFlowPyrLK(cur_gray, prev_gray, p0, None, winSize=(9, 9), maxLevel=3,
+                                         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    flow, ok = (p1 - p0).reshape(-1, 5, 2), st.reshape(-1, 5).astype(bool)
+    keep = []
+    for d, f, s in zip(dets, flow, ok):
+        if not s[0]:
+            continue
+        sky = np.median(f[1:][s[1:]], axis=0) if s[1:].any() else np.zeros(2)
+        rel = float(np.hypot(*(f[0] - sky)))
+        if MIN_REL_SPEED <= rel <= MAX_BIRD_SPEED:
+            d['motion_score'] = rel
+            keep.append(d)
+    return keep
+
+
 # ── Farneback implementation (kept for easy revert) ───────────────────────────
 # To revert: rename detect_moving_birds above to detect_moving_birds_lk,
 #            and rename detect_moving_birds_farneback below to detect_moving_birds.
@@ -886,6 +995,15 @@ class ImprovedBirdTracker:
         return current_frame_birds
 
     def is_flying_improved(self, track_id):
+        """v2: counted only if seen MIN_TRACK_POINTS times and it actually travelled."""
+        positions = self.tracks[track_id]['positions']
+        if len(positions) < MIN_TRACK_POINTS:
+            return False
+        (x0, y0), (x1, y1) = positions[0], positions[-1]
+        net = math.hypot(x1 - x0, y1 - y0)
+        return net >= MIN_NET_DISPLACEMENT and net / (len(positions) - 1) >= MIN_TRACK_SPEED
+
+    def is_flying_v1(self, track_id):
         positions = self.tracks[track_id]['positions']
         if len(positions) < MIN_FLIGHT_DURATION:
             return False
@@ -1108,13 +1226,64 @@ _RED                 = (0, 0, 255)
 _FRAME_SEND_INTERVAL = 15  # send annotated frame every N processed frames
 
 
-def process_video_streaming(video_path, threshold=None):
+def _save_checkpoint(path, state):
+    """Atomically pickle run state so a crash mid-write never leaves a torn checkpoint."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(state, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path, video_path):
+    """Return saved state for video_path, or None if missing, unreadable or for another file."""
+    try:
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+    except (OSError, pickle.UnpicklingError, EOFError) as e:
+        log.warning("[detection] ignoring checkpoint %s: %s", path, e)
+        return None
+    if state.get("video_size") != os.path.getsize(video_path):
+        log.warning("[detection] checkpoint %s is for a different file, ignoring", path)
+        return None
+    return state
+
+
+def _resume_warmup(cap, bg_subtractor, frame_count, size, detection_boundary):
+    """
+    Seek to just before frame_count and replay frames through MOG2 (no detection)
+    so its background model matches an uninterrupted run. Leaves cap positioned
+    exactly where the main loop expects it and returns the last gray ROI, which
+    becomes prev_frame_cache for optical flow.
+    """
+    start = max(0, frame_count - RESUME_WARMUP_FRAMES * FRAME_SKIP)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+    pos, roi = start, None
+    while pos < frame_count:
+        for _ in range(FRAME_SKIP - 1):
+            cap.grab()
+        ret, frame = cap.read()
+        if not ret:
+            break
+        pos += FRAME_SKIP
+        if RESIZE_FACTOR != 1.0:
+            frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+        roi = frame[:detection_boundary, :]
+        bg_subtractor.apply(roi)
+    return cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi is not None else None
+
+
+def process_video_streaming(video_path, threshold=None, checkpoint_path=None):
     """
     Generator version of process_video_with_unique_bird_counting.
     Yields dicts:
       {"kind": "frame",    "frame": <annotated BGR ndarray>}
       {"kind": "progress", "progress": float, "unique_birds": int, "elapsed": float}
       {"kind": "result",   "data": {...}}
+
+    checkpoint_path: if given, run state is saved there every CHECKPOINT_INTERVAL_S
+    and, if a checkpoint for this video already exists, processing resumes from it.
     """
     log.info("[detection] process_video_streaming START path=%s threshold=%s", video_path, threshold)
     cap = cv2.VideoCapture(video_path)
@@ -1126,8 +1295,11 @@ def process_video_streaming(video_path, threshold=None):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    new_width    = int(width  * RESIZE_FACTOR)
-    new_height   = int(height * RESIZE_FACTOR)
+    # Process every video at the same size (1440 px wide for 1080p and 4K alike): the v2
+    # thresholds are in pixels, so 4K must not be processed at twice the size.
+    scale        = RESIZE_FACTOR * min(1.0, 1920 / width) if width else RESIZE_FACTOR
+    new_width    = int(width  * scale)
+    new_height   = int(height * scale)
 
     log.info(
         "[detection] video: %dx%d @ %dfps, %d frames, processing at %dx%d FRAME_SKIP=%d threshold=%s",
@@ -1143,6 +1315,8 @@ def process_video_streaming(video_path, threshold=None):
     roi_bottom_pct    = float(INITIAL_ROI_BOTTOM_PERCENTAGE)
     detection_boundary = int(new_height * roi_bottom_pct / 100.0)
     prev_frame_cache  = None
+    sky_samples       = deque(maxlen=SKY_MASK_SAMPLES)
+    sky_mask          = None
     frame_count       = 0
     max_concurrent_birds = 0
     start_time        = time.time()
@@ -1153,6 +1327,24 @@ def process_video_streaming(video_path, threshold=None):
     prev_unique            = 0
     total_motion_sum       = 0.0
     total_motion_count     = 0
+
+    state = load_checkpoint(checkpoint_path, video_path) if checkpoint_path and os.path.exists(checkpoint_path) else None
+    if state:
+        bird_tracker            = state["tracker"]
+        frame_count             = state["frame_count"]
+        max_concurrent_birds    = state["max_concurrent_birds"]
+        first_detection_frame   = state["first_detection_frame"]
+        peak_concurrent_frame   = state["peak_concurrent_frame"]
+        birds_per_minute_counts = state["birds_per_minute_counts"]
+        prev_unique             = state["prev_unique"]
+        total_motion_sum        = state["total_motion_sum"]
+        total_motion_count      = state["total_motion_count"]
+        start_time              = time.time() - state["elapsed"]
+        prev_frame_cache = _resume_warmup(cap, bg_subtractor, frame_count,
+                                          (new_width, new_height), detection_boundary)
+        log.info("[detection] resumed from checkpoint at frame %d (%d unique birds so far)",
+                 frame_count, bird_tracker.get_unique_flying_birds_count())
+    last_checkpoint = time.time()
 
     # Profile accumulators
     _p = {k: 0.0 for k in ('decode', 'roi_update', 'adaptive_threshold',
@@ -1178,7 +1370,7 @@ def process_video_streaming(video_path, threshold=None):
             if frame_count == FRAME_SKIP:
                 log.info("[detection] First frame read OK shape=%s", frame.shape)
 
-            if RESIZE_FACTOR != 1.0:
+            if (new_width, new_height) != (width, height):
                 frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
             if _PROFILE:
@@ -1190,28 +1382,17 @@ def process_video_streaming(video_path, threshold=None):
             roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
             roi_hsv  = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
 
+            # v2: dark spots in V -> sky surroundings -> moving relative to the sky.
+            # (v1 used detect_birds_in_frame + MOG2 + detect_moving_birds, which counted clouds.)
             _t0 = time.perf_counter() if _PROFILE else 0
-            current_detections, current_gray_roi = detect_birds_in_frame(
-                frame, new_height, detection_boundary, threshold=threshold
-            )
+            if frame_count % (SKY_MASK_EVERY * FRAME_SKIP) == 0 or sky_mask is None:
+                sky_samples.append(roi_bgr.copy())
+                sky_mask = build_sky_mask(sky_samples)
+            current_detections = [d for d in detect_dark_objects(roi_hsv)
+                                  if sky_mask[d['center'][1], d['center'][0]]]
             if _PROFILE:
                 _p['adaptive_threshold'] += time.perf_counter() - _t0
 
-            # MOG2 background subtraction: detect any pixel-level movement in the sky
-            _t0 = time.perf_counter() if _PROFILE else 0
-            fg_mask = bg_subtractor.apply(roi_bgr)
-            mog_detections = _extract_mog_detections(fg_mask, roi_bgr,
-                                                      gray_roi=roi_gray, hsv_roi=roi_hsv)
-            existing = [(d['center'][0], d['center'][1]) for d in current_detections]
-            for d in mog_detections:
-                cx, cy = d['center']
-                if not any(abs(cx - ex) < 6 and abs(cy - ey) < 6 for ex, ey in existing):
-                    current_detections.append(d)
-                    existing.append((cx, cy))
-            if _PROFILE:
-                _p['mog2'] += time.perf_counter() - _t0
-
-            # Sky color filter — reuse precomputed roi_hsv (all candidates are within ROI)
             _t0 = time.perf_counter() if _PROFILE else 0
             sky_detections = [
                 d for d in current_detections
@@ -1221,9 +1402,8 @@ def process_video_streaming(video_path, threshold=None):
                 _p['sky_filter'] += time.perf_counter() - _t0
 
             _t0 = time.perf_counter() if _PROFILE else 0
-            moving_detections, prev_frame_cache = detect_moving_birds(
-                sky_detections, current_gray_roi, prev_frame_cache, roi_bgr
-            )
+            moving_detections = moving_against_sky(sky_detections, prev_frame_cache, roi_gray)
+            prev_frame_cache = roi_gray
             if _PROFILE:
                 _p['optical_flow'] += time.perf_counter() - _t0
 
@@ -1256,6 +1436,22 @@ def process_video_streaming(video_path, threshold=None):
                     total_motion_sum   += det['motion_score']
                     total_motion_count += 1
 
+            if checkpoint_path and time.time() - last_checkpoint >= CHECKPOINT_INTERVAL_S:
+                _save_checkpoint(checkpoint_path, {
+                    "video_size":              os.path.getsize(video_path),
+                    "frame_count":             frame_count,
+                    "elapsed":                 time.time() - start_time,
+                    "tracker":                 bird_tracker,
+                    "max_concurrent_birds":    max_concurrent_birds,
+                    "first_detection_frame":   first_detection_frame,
+                    "peak_concurrent_frame":   peak_concurrent_frame,
+                    "birds_per_minute_counts": birds_per_minute_counts,
+                    "prev_unique":             prev_unique,
+                    "total_motion_sum":        total_motion_sum,
+                    "total_motion_count":      total_motion_count,
+                })
+                last_checkpoint = time.time()
+
             if frame_count == FRAME_SKIP:
                 log.info(
                     "[detection] Frame 1 processed: detections=%d sky=%d moving=%d",
@@ -1265,6 +1461,9 @@ def process_video_streaming(video_path, threshold=None):
             _t0 = time.perf_counter() if _PROFILE else 0
             if frame_count % _FRAME_SEND_INTERVAL == 0:
                 display = frame.copy()
+                # Darken what the sky mask excludes, so it can be checked by eye
+                not_sky = ~sky_mask
+                display[:detection_boundary][not_sky] = display[:detection_boundary][not_sky] // 2
 
                 # Draw confirmed active tracks — box follows the bird each frame
                 confirmed_bboxes = bird_tracker.get_active_confirmed_bboxes()

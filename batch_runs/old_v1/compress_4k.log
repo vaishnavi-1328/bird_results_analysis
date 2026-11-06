@@ -1,0 +1,12 @@
+﻿2026-10-28T11:58:09  waiting for bird batch and 09-29_B compression to finish
+2026-10-28T12:31:13  waiting for bird batch and 09-29_B compression to finish
+2026-11-02T19:21:19  NOT moving C:\Farm_videos\farm_video_1080p.mp4 - its length does not match the original (ffmpeg stopped early?)
+2026-11-02T19:21:19  compress start C:\Farm_videos\09302026\locationA\farm_video_compressed.mp4
+2026-11-02T22:26:34  compress done C:\Farm_videos\09302026\locationA\farm_video_compressed_1080.mp4
+2026-11-02T22:26:34  detection start C:\Farm_videos\09302026\locationA\farm_video_compressed_1080.mp4
+2026-11-02T22:26:34  compress start C:\Farm_videos\10092026\locationb\merged.mp4
+2026-11-03T02:21:24  compress done C:\Farm_videos\10092026\locationb\merged_1080.mp4
+2026-11-03T02:21:24  detection start C:\Farm_videos\10092026\locationb\merged_1080.mp4
+2026-11-03T04:52:41  detection done 2026-09-30_A - logs\2026-09-30_A_1080.jsonl and 2026-09-30_A_1080_per_minute.csv
+2026-11-03T11:55:46  detection done 2026-10-09_B - logs\2026-10-09_B_1080.jsonl and 2026-10-09_B_1080_per_minute.csv
+2026-11-03T11:55:46  all done

@@ -1,0 +1,32 @@
+skip 10072026/locationa: no video
+skip 10212026/locationB: no video
+skip 10212026/locationa: no video
+19 videos found, order:
+  2026-09-29_A 1920x1080 9.05h
+  2026-09-30_B 1920x1080 10.74h
+  2026-10-05_A 1920x1080 11.67h
+  2026-10-06_B 1920x1080 11.86h
+  2026-10-07_B 1920x1080 11.23h
+  2026-10-09_A 1920x1080 11.67h
+  2026-10-14_A 1920x1080 10.75h
+  2026-10-14_B 1920x1080 10.74h
+  2026-10-15_A 1920x1080 11.15h
+  2026-10-15_B 1920x1080 11.12h
+  2026-10-16_A 1920x1080 6.94h
+  2026-10-16_B 1920x1080 9.21h
+  2026-10-20_A 1920x1080 10.69h
+  2026-10-20_B 1920x1080 10.67h
+  2026-09-29_B 3840x2160 11.18h
+  2026-09-30_A 3840x2160 11.11h
+  2026-10-05_B 3840x2160 11.62h
+  2026-10-06_A 3840x2160 12.06h
+  2026-10-09_B 3840x2160 11.65h
+[2026-09-29_B] already done (attempts=3), skipping
+[2026-09-30_A] already done (attempts=1), skipping
+[2026-10-05_B] already done (attempts=1), skipping
+[2026-10-06_A] already done (attempts=1), skipping
+15 videos to run, 4 at a time
+[2026-09-29_A] start (attempt 1) C:\Farm_videos\09292026\locationA\merged.mp4
+[2026-09-30_B] start (attempt 1) C:\Farm_videos\09302026\locationB\merged.mp4
+[2026-10-05_A] start (attempt 1) C:\Farm_videos\10052026\locationa\merged.mp4
+[2026-10-06_B] start (attempt 1) C:\Farm_videos\10062026\locationb\merged.mp4

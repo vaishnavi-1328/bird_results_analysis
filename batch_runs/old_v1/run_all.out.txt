@@ -1,0 +1,58 @@
+skip 10072026/locationa: no video
+skip 10212026/locationB: no video
+skip 10212026/locationa: no video
+19 videos found, order:
+  2026-09-29_A 1920x1080 9.05h
+  2026-09-30_B 1920x1080 10.74h
+  2026-10-05_A 1920x1080 11.67h
+  2026-10-06_B 1920x1080 11.86h
+  2026-10-07_B 1920x1080 11.23h
+  2026-10-09_A 1920x1080 11.67h
+  2026-10-14_A 1920x1080 10.75h
+  2026-10-14_B 1920x1080 10.74h
+  2026-10-15_A 1920x1080 11.15h
+  2026-10-15_B 1920x1080 11.12h
+  2026-10-16_A 1920x1080 6.94h
+  2026-10-16_B 1920x1080 9.21h
+  2026-10-20_A 1920x1080 10.69h
+  2026-10-20_B 1920x1080 10.67h
+  2026-09-29_B 3840x2160 11.18h
+  2026-09-30_A 3840x2160 11.11h
+  2026-10-05_B 3840x2160 11.62h
+  2026-10-06_A 3840x2160 12.06h
+  2026-10-09_B 3840x2160 11.65h
+[2026-09-29_B] already done (attempts=3), skipping
+[2026-09-30_A] already done (attempts=1), skipping
+[2026-10-05_B] already done (attempts=1), skipping
+[2026-10-06_A] already done (attempts=1), skipping
+[2026-10-09_B] skipped (--skip)
+14 videos to run, 4 at a time
+[2026-09-29_A] resume (attempt 2) C:\Farm_videos\09292026\locationA\merged.mp4
+[2026-09-30_B] resume (attempt 2) C:\Farm_videos\09302026\locationB\merged.mp4
+[2026-10-05_A] resume (attempt 2) C:\Farm_videos\10052026\locationa\merged.mp4
+[2026-10-06_B] resume (attempt 2) C:\Farm_videos\10062026\locationb\merged.mp4
+[2026-09-29_A] done rc=0 last_frame=976924 birds=85661
+[2026-10-07_B] start (attempt 1) C:\Farm_videos\10072026\locationb\merged.mp4
+[2026-09-30_B] done rc=0 last_frame=1159072 birds=21099
+[2026-10-09_A] start (attempt 1) C:\Farm_videos\10092026\locationa\merged.mp4
+[2026-10-06_B] done rc=0 last_frame=1280068 birds=259610
+[2026-10-14_A] start (attempt 1) C:\Farm_videos\10142026\locationA\merged.mp4
+[2026-10-05_A] done rc=0 last_frame=1258624 birds=19194
+[2026-10-14_B] start (attempt 1) C:\Farm_videos\10142026\locationB\merged.mp4
+[2026-10-09_A] done rc=0 last_frame=1259250 birds=144371
+[2026-10-15_A] start (attempt 1) C:\Farm_videos\10152026\locationA\merged.mp4
+[2026-10-07_B] done rc=0 last_frame=1211404 birds=95400
+[2026-10-15_B] start (attempt 1) C:\Farm_videos\10152026\locationB\merged.mp4
+[2026-10-14_A] done rc=0 last_frame=1159674 birds=124561
+[2026-10-16_A] start (attempt 1) C:\Farm_videos\10162026\locationA\merged.mp4
+[2026-10-14_B] done rc=0 last_frame=1158472 birds=101177
+[2026-10-16_B] start (attempt 1) C:\Farm_videos\10162026\locationB\merged.mp4
+[2026-10-16_A] done rc=0 last_frame=748576 birds=8263
+[2026-10-20_A] start (attempt 1) C:\Farm_videos\10202026\locationa\merged.mp4
+[2026-10-15_B] done rc=0 last_frame=1199444 birds=53673
+[2026-10-20_B] start (attempt 1) C:\Farm_videos\10202026\locationb\merged.mp4
+[2026-10-16_B] done rc=0 last_frame=993558 birds=25262
+[2026-10-15_A] done rc=0 last_frame=1203014 birds=53609
+[2026-10-20_A] done rc=0 last_frame=1153444 birds=661
+[2026-10-20_B] done rc=0 last_frame=1151632 birds=1387
+all done
