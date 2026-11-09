@@ -44,3 +44,6 @@ skip 10072026/locationa: no video
 2 videos to run, 4 at a time
 [2026-10-21_A] start (attempt 2) C:\Farm_videos\10212026\locationa\merged.mp4
 [2026-10-21_B] start (attempt 2) C:\Farm_videos\10212026\locationB\merged.mp4
+[2026-10-21_B] done rc=0 last_frame=697742 birds=1687
+[2026-10-21_A] done rc=0 last_frame=1128550 birds=359
+all done
