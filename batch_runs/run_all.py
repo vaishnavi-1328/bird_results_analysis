@@ -1,4 +1,4 @@
-"""Batch-run detection on every C:\\Farm_videos\\<mmddyyyy>\\<location>\\ video, one child process per video.
+"""Batch-run detection on every Farm_videos/<mmddyyyy>/<location>/ video, one child process per video.
 
 Usage:  python run_all.py              (resumes; interrupted/crashed videos continue from their checkpoint)
         python run_all.py --retry      (also re-runs safety_stop/error videos)
@@ -8,7 +8,12 @@ Usage:  python run_all.py              (resumes; interrupted/crashed videos cont
 Children run at below-normal priority. A video is given up on after MAX_ATTEMPTS starts.
 Where a folder has a *_1080* re-encode next to the 4K original, the 1080p file is used,
 with the original's start time from starttimes.csv.
-Outputs, one folder per location under OUT (results_v2\\location_A, results_v2\\location_B):
+
+All paths are relative to the repo root (the parent of this batch_runs/ folder):
+  Farm_videos/                      input videos, one subfolder per date (mmddyyyy), then per location
+  results_v2/location_A|B/          output CSVs and logs
+
+Outputs, one folder per location under OUT (results_v2/location_A, results_v2/location_B):
   results.csv                       one row per video
   <date>_<loc>_per_minute.csv       new birds per minute of footage, with wall-clock time
   logs/<date>_<loc>.jsonl           heartbeat every HEARTBEAT frames (flushed + fsynced)
@@ -19,10 +24,11 @@ Recording start times come from starttimes.csv (camera timecode HH:MM:SS;FF, ';'
 """
 import concurrent.futures, csv, ctypes, datetime, faulthandler, json, os, subprocess, sys, threading, time
 
-ROOT       = r"C:\Farm_videos"
-BACKEND    = r"C:\Bird_influenza_analysis\backend"
 HERE       = os.path.dirname(os.path.abspath(__file__))
-OUT        = r"C:\Bird_influenza_analysis\results_v2"
+REPO_ROOT  = os.path.dirname(HERE)
+ROOT       = os.path.join(REPO_ROOT, "Farm_videos")
+BACKEND    = os.path.join(REPO_ROOT, "backend")
+OUT        = os.path.join(REPO_ROOT, "results_v2")
 STARTTIMES = os.path.join(HERE, "starttimes.csv")
 THRESHOLD  = 127          # same value the frontend sends
 HEARTBEAT  = 2000         # frames between heartbeats
