@@ -35,6 +35,7 @@ FIELDS = ["date", "location", "start_timecode", "recording_start", "recording_en
           "duration_hours", "status", "attempts", "cv_threads", "exit_code", "last_frame", "last_video_time", "last_frame_clock_time",
           "progress_pct",
           "peak_rss_mb", "min_sys_avail_gb", "unique_flying_birds", "max_concurrent_birds", "total_tracks",
+          "first_detection_second", "track_noise_ratio", "avg_motion_score",
           "processing_time_s", "wall_start", "wall_end", "python", "opencv", "note"]
 
 
@@ -109,7 +110,7 @@ def add_clock_times(row, job):
 
 
 def write_per_minute(job, log_path):
-    """Per-minute new-bird counts from the final result, labelled with wall-clock time."""
+    """Per-minute new-bird counts and max concurrent from the final result, labelled with wall-clock time."""
     result = None
     with open(log_path) as f:
         for line in f:
@@ -122,11 +123,16 @@ def write_per_minute(job, log_path):
     if not result or not job.get("timecode"):
         return
     start = recording_start(job["date"], job["timecode"], result.get("fps") or 30)
+    new_birds = json.loads(result["birds_per_minute"])
+    max_conc   = json.loads(result.get("max_concurrent_per_minute") or "[]")
+    # Pad max_conc to same length as new_birds in case of old logs without it
+    while len(max_conc) < len(new_birds):
+        max_conc.append(0)
     with open(os.path.join(loc_dir(job["location"]), key(job) + "_per_minute.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["minute", "clock_time", "new_birds"])
-        for i, n in enumerate(json.loads(result["birds_per_minute"])):
-            w.writerow([i, (start + datetime.timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"), n])
+        w.writerow(["minute", "clock_time", "new_birds", "max_concurrent"])
+        for i, (n, mc) in enumerate(zip(new_birds, max_conc)):
+            w.writerow([i, (start + datetime.timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"), n, mc])
 
 
 def read_results():
@@ -170,9 +176,16 @@ def summarize_log(log_path):
                 out["min_sys_avail_gb"] = min(out["min_sys_avail_gb"], e["sys_avail_gb"])
             for k in ("last_frame", "last_video_time", "progress_pct", "width", "height", "fps",
                       "total_frames", "duration_hours", "python", "opencv", "status", "note",
-                      "unique_flying_birds", "max_concurrent_birds", "total_tracks", "processing_time_s"):
+                      "unique_flying_birds", "max_concurrent_birds", "total_tracks", "processing_time_s",
+                      "first_detection_second", "track_noise_ratio", "avg_motion_score"):
                 if k in e:
                     out[k] = e[k]
+            # New fields live inside the nested result dict on the result event
+            if e.get("event") == "result" and "result" in e:
+                r = e["result"]
+                for k in ("first_detection_second", "track_noise_ratio", "avg_motion_score"):
+                    if k in r:
+                        out[k] = r[k]
     if out["min_sys_avail_gb"] == 99.0:
         out["min_sys_avail_gb"] = ""
     return out

@@ -1321,24 +1321,26 @@ def process_video_streaming(video_path, threshold=None, checkpoint_path=None):
     max_concurrent_birds = 0
     start_time        = time.time()
 
-    first_detection_frame  = None
-    peak_concurrent_frame  = 0
+    first_detection_frame       = None
+    peak_concurrent_frame       = 0
     birds_per_minute_counts: dict[int, int] = {}
-    prev_unique            = 0
-    total_motion_sum       = 0.0
-    total_motion_count     = 0
+    max_concurrent_per_minute: dict[int, int] = {}
+    prev_unique                 = 0
+    total_motion_sum            = 0.0
+    total_motion_count          = 0
 
     state = load_checkpoint(checkpoint_path, video_path) if checkpoint_path and os.path.exists(checkpoint_path) else None
     if state:
-        bird_tracker            = state["tracker"]
-        frame_count             = state["frame_count"]
-        max_concurrent_birds    = state["max_concurrent_birds"]
-        first_detection_frame   = state["first_detection_frame"]
-        peak_concurrent_frame   = state["peak_concurrent_frame"]
-        birds_per_minute_counts = state["birds_per_minute_counts"]
-        prev_unique             = state["prev_unique"]
-        total_motion_sum        = state["total_motion_sum"]
-        total_motion_count      = state["total_motion_count"]
+        bird_tracker                = state["tracker"]
+        frame_count                 = state["frame_count"]
+        max_concurrent_birds        = state["max_concurrent_birds"]
+        first_detection_frame       = state["first_detection_frame"]
+        peak_concurrent_frame       = state["peak_concurrent_frame"]
+        birds_per_minute_counts     = state["birds_per_minute_counts"]
+        max_concurrent_per_minute   = state.get("max_concurrent_per_minute", {})
+        prev_unique                 = state["prev_unique"]
+        total_motion_sum            = state["total_motion_sum"]
+        total_motion_count          = state["total_motion_count"]
         start_time              = time.time() - state["elapsed"]
         prev_frame_cache = _resume_warmup(cap, bg_subtractor, frame_count,
                                           (new_width, new_height), detection_boundary)
@@ -1422,6 +1424,11 @@ def process_video_streaming(video_path, threshold=None, checkpoint_path=None):
                 max_concurrent_birds  = currently_active
                 peak_concurrent_frame = frame_count
 
+            if fps > 0:
+                minute_idx = int(frame_count / fps / 60)
+                if currently_active > max_concurrent_per_minute.get(minute_idx, 0):
+                    max_concurrent_per_minute[minute_idx] = currently_active
+
             if unique_flying_birds > prev_unique:
                 if fps > 0:
                     minute_idx = int(frame_count / fps / 60)
@@ -1438,17 +1445,18 @@ def process_video_streaming(video_path, threshold=None, checkpoint_path=None):
 
             if checkpoint_path and time.time() - last_checkpoint >= CHECKPOINT_INTERVAL_S:
                 _save_checkpoint(checkpoint_path, {
-                    "video_size":              os.path.getsize(video_path),
-                    "frame_count":             frame_count,
-                    "elapsed":                 time.time() - start_time,
-                    "tracker":                 bird_tracker,
-                    "max_concurrent_birds":    max_concurrent_birds,
-                    "first_detection_frame":   first_detection_frame,
-                    "peak_concurrent_frame":   peak_concurrent_frame,
-                    "birds_per_minute_counts": birds_per_minute_counts,
-                    "prev_unique":             prev_unique,
-                    "total_motion_sum":        total_motion_sum,
-                    "total_motion_count":      total_motion_count,
+                    "video_size":                os.path.getsize(video_path),
+                    "frame_count":               frame_count,
+                    "elapsed":                   time.time() - start_time,
+                    "tracker":                   bird_tracker,
+                    "max_concurrent_birds":      max_concurrent_birds,
+                    "first_detection_frame":     first_detection_frame,
+                    "peak_concurrent_frame":     peak_concurrent_frame,
+                    "birds_per_minute_counts":   birds_per_minute_counts,
+                    "max_concurrent_per_minute": max_concurrent_per_minute,
+                    "prev_unique":               prev_unique,
+                    "total_motion_sum":          total_motion_sum,
+                    "total_motion_count":        total_motion_count,
                 })
                 last_checkpoint = time.time()
 
@@ -1524,30 +1532,32 @@ def process_video_streaming(video_path, threshold=None, checkpoint_path=None):
 
         total_minutes = (int(frame_count / fps / 60) + 1) if fps > 0 else 0
         minute_counts = [birds_per_minute_counts.get(m, 0) for m in range(total_minutes)]
+        max_conc_per_min = [max_concurrent_per_minute.get(m, 0) for m in range(total_minutes)]
 
         yield {
             "kind": "result",
             "data": {
-                "unique_flying_birds":    unique_flying_birds,
-                "max_concurrent_birds":   max_concurrent_birds,
-                "frames_processed":       frame_count,
-                "total_tracks":           bird_tracker.track_id,
-                "fps":                    fps,
-                "total_frames":           total_frames,
-                "duration_seconds":       (
+                "unique_flying_birds":       unique_flying_birds,
+                "max_concurrent_birds":      max_concurrent_birds,
+                "frames_processed":          frame_count,
+                "total_tracks":              bird_tracker.track_id,
+                "fps":                       fps,
+                "total_frames":              total_frames,
+                "duration_seconds":          (
                     (total_frames / fps) if (fps > 0 and total_frames > 0)
                     else round(total_time, 1)
                 ),
-                "processing_time":        round(total_time, 1),
-                "processing_speed":       round(frame_count / total_time, 2) if total_time > 0 else 0,
-                "first_detection_second": (
+                "processing_time":           round(total_time, 1),
+                "processing_speed":          round(frame_count / total_time, 2) if total_time > 0 else 0,
+                "first_detection_second":    (
                     round(first_detection_frame / fps, 1)
                     if first_detection_frame and fps > 0 else None
                 ),
-                "peak_concurrent_second": round(peak_concurrent_frame / fps, 1) if fps > 0 else 0,
-                "birds_per_minute":       json.dumps(minute_counts),
-                "track_noise_ratio":      round(unique_flying_birds / max(1, bird_tracker.track_id), 3),
-                "avg_motion_score":       round(total_motion_sum / max(1, total_motion_count), 2),
+                "peak_concurrent_second":    round(peak_concurrent_frame / fps, 1) if fps > 0 else 0,
+                "birds_per_minute":          json.dumps(minute_counts),
+                "max_concurrent_per_minute": json.dumps(max_conc_per_min),
+                "track_noise_ratio":         round(unique_flying_birds / max(1, bird_tracker.track_id), 3),
+                "avg_motion_score":          round(total_motion_sum / max(1, total_motion_count), 2),
             },
         }
 
